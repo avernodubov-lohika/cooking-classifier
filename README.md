@@ -75,9 +75,90 @@ traffic. Treat `predict.py`'s free-form probe queries (written outside the templ
 more honest signal. Before trusting this for production routing, swap in real query logs for at
 least the validation/test splits.
 
+## Deploying to Elastic Cloud
+
+Once `train.py` has produced `models/cooking-safety-classifier/`, it can be uploaded to an
+Elastic Cloud deployment as a trained model and used for inference directly from Elasticsearch —
+no separate model-serving process needed.
+
+### 1. Prerequisites
+
+- An Elastic Cloud deployment with a machine learning node sized to hold the model (DistilBERT
+  is ~260MB in fp32 — the smallest ML tier is generally enough for one allocation, but check
+  under Deployment → Edit → Machine Learning instances if the import/deploy step fails on
+  capacity).
+- **Cloud ID** — deployment page → "Manage this deployment" → Cloud ID.
+- An **API key** with the `manage_ml` cluster privilege — Kibana → Stack Management → API Keys.
+- [`eland`](https://github.com/elastic/eland) installed locally with the PyTorch extra (this is
+  the same tool referenced, commented out, in `search/rose.elasticsearch/docker-compose.yml`):
+
+  ```bash
+  python -m pip install "eland[pytorch]"
+  ```
+
+### 2. Import the model
+
+```bash
+eland_import_hub_model \
+  --cloud-id "$CLOUD_ID" \
+  --es-api-key "$ES_API_KEY" \
+  --hub-model-id ./models/cooking-safety-classifier \
+  --task-type text_classification \
+  --clear-previous \
+  --start
+```
+
+`--hub-model-id` normally names a Hugging Face Hub model, but also accepts a local model
+directory in the same layout `train.py` saves (`config.json`, `model.safetensors`, tokenizer
+files) — confirm against `eland_import_hub_model --help` for the installed eland version.
+`--start` uploads the model *and* starts its deployment in one step; `--clear-previous` makes
+re-running the same command after retraining safe (drops the old version under the same model
+id first). If you're deploying multiple versions side by side instead, drop `--clear-previous`
+and pass a distinct `--es-model-id` per version.
+
+### 3. Verify it deployed
+
+```
+GET _ml/trained_models/cooking-safety-classifier/_stats
+```
+
+Kibana → Machine Learning → Trained Models shows the same thing with a state column.
+
+### 4. Run inference
+
+Query-time — this is the call that would replace the current LLM-prompt classifier
+(`detectQuerySafety` in `cooking-llm/cookx/prototypes/user-intent/src/prompts.ts`) on the search
+path:
+
+```
+POST _ml/trained_models/cooking-safety-classifier/_infer
+{
+  "docs": [{ "text_field": "how to kill yeast if the water is too hot" }]
+}
+```
+
+```json
+{
+  "inference_results": [
+    { "predicted_value": "SAFE_COOKING", "prediction_probability": 0.98 }
+  ]
+}
+```
+
+Alternatively, wire it into an ingest pipeline's `inference` processor to classify queries (or
+documents) at index time instead of per-request, if the caller can tolerate that instead of a
+live call.
+
+### Notes
+
+- This is a per-version import: re-run `eland_import_hub_model` whenever `train.py` produces a
+  new model, then point callers at the new `--es-model-id` (or use `--clear-previous` to replace
+  the existing one in place).
+- Elastic Cloud's ML autoscaling can spin ML nodes up/down on demand, but if the ML tier is
+  currently scaled to zero the first import may need it resized manually before `--start`
+  succeeds.
+
 ## Out of scope
 
-- Elasticsearch import (the eland `text_classification` task-type import, see
-  `search/rose.elasticsearch/docker-compose.yml`).
 - Reconciling this label taxonomy with the existing `is_toxic`/`is_gibberish` and
   `CookingSearchIntentType` enums used elsewhere in the cooking stack.
