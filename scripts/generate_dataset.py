@@ -3,9 +3,15 @@ import random
 from pathlib import Path
 
 RANDOM_SEED = 42
-TARGET_PER_CLASS = 1500
+TARGET_PER_CLASS = 2000
 SPLIT_RATIOS = {"train": 0.8, "validation": 0.1, "test": 0.1}
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+REAL_SAFE_QUERIES_PATH = DATA_DIR / "real_safe_queries.txt"
+# Cooking terms extracted from cooking-rose unigrams/bigrams.csv by scripts/extract_ngram_terms.py.
+NGRAM_UNIGRAMS_PATH = DATA_DIR / "ngram_safe_unigrams.txt"
+NGRAM_BIGRAMS_PATH = DATA_DIR / "ngram_safe_bigrams.txt"
+NGRAM_UNIGRAM_SAMPLE = 250  # SAFE_COOKING examples sampled per run (the full lists are much larger)
+NGRAM_BIGRAM_SAMPLE = 250
 
 # --- seed examples (hand-authored, always included) -----------------------
 
@@ -35,6 +41,20 @@ SEED_SAFE_COOKING = [
     "crush the garlic cloves with the flat of a knife", "pound the chicken breast thin with a mallet",
     "how to spatchcock a chicken",
 ]
+
+# Real search queries that the production classifier wrongly blocked as "harmful"
+# (gluten-free, leek, pork chops, bone-in thighs, ...). Hand-curated: gibberish, ids and
+# off-topic queries are excluded. One query per line in data/real_safe_queries.txt.
+def load_lines(path):
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def load_real_safe_queries(path=REAL_SAFE_QUERIES_PATH):
+    return load_lines(path)
+
+
+SEED_SAFE_COOKING += load_real_safe_queries()
 
 SEED_HARMFUL = [
     "how to poison someone's food without them noticing",
@@ -410,6 +430,67 @@ NON_COOKING_TEMPLATES = [
 ]
 
 
+# Short (1-3 word) HARMFUL / NON_COOKING queries. SAFE_COOKING contains many short real queries
+# and n-gram terms, so without short negatives the model learns "short query => SAFE_COOKING".
+SHORT_HARMFUL_TEMPLATES = [
+    ("poison {target}", {"target": TARGETS}),
+    ("poison {target}'s {food}", {"target": TARGETS, "food": FOODS}),
+    ("poison {food}", {"food": FOODS}),
+    ("{substance} in {drink}", {"substance": SUBSTANCES, "drink": DRINKS}),
+    ("{substance} in {food}", {"substance": SUBSTANCES, "food": FOODS}),
+    ("spike {target}'s {drink}", {"target": TARGETS, "drink": DRINKS}),
+    ("spike a {drink}", {"drink": DRINKS}),
+    ("drug {target}'s {drink}", {"target": TARGETS, "drink": DRINKS}),
+    ("drug {target}", {"target": TARGETS}),
+    ("slip {substance} in {drink}", {"substance": SUBSTANCES, "drink": DRINKS}),
+    ("lethal {substance}", {"substance": SUBSTANCES}),
+    ("{substance} dose lethal", {"substance": SUBSTANCES}),
+    ("make {target} sick", {"target": TARGETS}),
+    ("untraceable {substance}", {"substance": SUBSTANCES}),
+    ("tamper with {target}'s {food}", {"target": TARGETS, "food": FOODS}),
+]
+
+SHORT_NON_COOKING_TEMPLATES = [
+    ("{crypto}", {"crypto": CRYPTOS}),
+    ("{crypto} price", {"crypto": CRYPTOS}),
+    ("buy {crypto}", {"crypto": CRYPTOS}),
+    ("{city} weather", {"city": CITIES}),
+    ("weather {city}", {"city": CITIES}),
+    ("weather tomorrow", {}),
+    ("weather forecast", {}),
+    ("weather radar", {}),
+    ("{sport} scores", {"sport": SPORTS}),
+    ("{sport} standings", {"sport": SPORTS}),
+    ("{sport}", {"sport": SPORTS}),
+    ("{device}", {"device": DEVICES}),
+    ("{device} deals", {"device": DEVICES}),
+    ("{device} review", {"device": DEVICES}),
+    ("flights to {city}", {"city": CITIES}),
+    ("hotels in {city}", {"city": CITIES}),
+    ("cheap hotels", {}),
+    ("cheap tickets", {}),
+    ("{celebrity}", {"celebrity": CELEBRITIES}),
+    ("{movie}", {"movie": MOVIES}),
+    ("{movie} cast", {"movie": MOVIES}),
+    ("{company} stock", {"company": COMPANIES}),
+    ("{company} news", {"company": COMPANIES}),
+    ("stock market today", {}),
+    ("election results", {}),
+    ("traffic {city}", {"city": CITIES}),
+    ("{vehicle} insurance", {"vehicle": VEHICLES}),
+    ("learn {language}", {"language": LANGUAGES}),
+]
+
+SHORT_SAMPLE_PER_CLASS = 300
+
+# Exact negative-class strings used as probes in predict.py. Never train on them, or the probes stop being
+# a held-out check.
+PROBE_HOLDOUT = {
+    "poison coffee", "drug a drink", "rat poison in food", "bitcoin", "weather", "nba scores",
+    "cheap flights",
+}
+
+
 def expand(template, vocab):
     if not vocab:
         return [template]
@@ -527,15 +608,32 @@ def main():
         global_used.update(result)
         return result
 
+    seed_set = set(SEED_SAFE_COOKING)
+    ngram_seeds = []
+    for path, k in [(NGRAM_UNIGRAMS_PATH, NGRAM_UNIGRAM_SAMPLE), (NGRAM_BIGRAMS_PATH, NGRAM_BIGRAM_SAMPLE)]:
+        terms = [t for t in load_lines(path) if t not in seed_set]
+        ngram_seeds.extend(rng.sample(terms, min(k, len(terms))))
+    safe_seed = SEED_SAFE_COOKING + ngram_seeds
+
     safe_examples = build_class_examples(
-        SEED_SAFE_COOKING, safe_pool, TARGET_PER_CLASS, rng, hard_negative_pool=hard_negative_pool
+        safe_seed, safe_pool, TARGET_PER_CLASS, rng, hard_negative_pool=hard_negative_pool
     )
     safe_examples = dedupe_against_global(safe_examples)
 
-    harmful_examples = build_class_examples(SEED_HARMFUL, harmful_pool, TARGET_PER_CLASS, rng)
+    def short_seed(templates, base):
+        pool = set()
+        for tpl, vocab in templates:
+            pool.update(expand(tpl, vocab))
+        pool = sorted(pool - set(base) - PROBE_HOLDOUT)
+        return rng.sample(pool, min(SHORT_SAMPLE_PER_CLASS, len(pool)))
+
+    harmful_seed = SEED_HARMFUL + short_seed(SHORT_HARMFUL_TEMPLATES, SEED_HARMFUL)
+    non_cooking_seed = SEED_NON_COOKING + short_seed(SHORT_NON_COOKING_TEMPLATES, SEED_NON_COOKING)
+
+    harmful_examples = build_class_examples(harmful_seed, harmful_pool, TARGET_PER_CLASS, rng)
     harmful_examples = dedupe_against_global(harmful_examples)
 
-    non_cooking_examples = build_class_examples(SEED_NON_COOKING, non_cooking_pool, TARGET_PER_CLASS, rng)
+    non_cooking_examples = build_class_examples(non_cooking_seed, non_cooking_pool, TARGET_PER_CLASS, rng)
     non_cooking_examples = dedupe_against_global(non_cooking_examples)
 
     print(f"final class sizes: SAFE_COOKING={len(safe_examples)} HARMFUL={len(harmful_examples)} "
